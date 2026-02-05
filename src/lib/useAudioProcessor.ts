@@ -280,8 +280,8 @@ export const useAudioProcessor = () => {
 
                     if (midi === lastMidi) {
                         stableFrames++;
-                        // Require MORE stability (approx 200ms at 60fps) to avoid jitter
-                        if (stableFrames === 12) {
+                        // Require slightly more stability for live mic to avoid jitters
+                        if (stableFrames === 6) {
                             const abc = midiToAbc(midi);
 
                             // SMART MERGE LOGIC:

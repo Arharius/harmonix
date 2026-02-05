@@ -280,27 +280,68 @@ export const useAudioProcessor = () => {
 
                     if (midi === lastMidi) {
                         stableFrames++;
-                        // Require slightly more stability for live mic to avoid jitters
-                        if (stableFrames === 6) {
+                        // Require MORE stability (approx 200ms at 60fps) to avoid jitter
+                        if (stableFrames === 12) {
                             const abc = midiToAbc(midi);
-                            liveMidiRef.current.push(midi);
+
+                            // SMART MERGE LOGIC:
+                            // Instead of pushing [C, C, C], extend previous note [C3]
+                            // This stops the UI from "twitching" (layout rebuilds)
+
                             setMelody(prev => {
-                                const next = [...prev, abc];
-                                measureCount++;
-                                if (measureCount % qValue === 0) next.push("|"); // Use qValue for bar lines
-                                return next;
+                                const lastIdx = prev.length - 1;
+                                const lastItem = prev[lastIdx]; // e.g. "C" or "C2" or "|"
+
+                                // Check if last item is same note
+                                if (lastItem && lastItem !== "|" && lastItem.startsWith(abc)) {
+                                    // Extract current duration number
+                                    const match = lastItem.match(/\d+$/);
+                                    let dur = match ? parseInt(match[0]) : 1;
+                                    dur++;
+
+                                    // Replace last item with extended duration
+                                    const newPrev = [...prev];
+                                    newPrev[lastIdx] = abc + dur;
+                                    return newPrev;
+                                } else {
+                                    // New note, push it
+                                    liveMidiRef.current.push(midi);
+                                    const next = [...prev, abc];
+                                    measureCount++;
+                                    if (measureCount % qValue === 0) next.push("|");
+                                    return next;
+                                }
                             });
-                            // Real-time harmony
+
+                            // Real-time harmony (same merge logic)
                             setHarmony(prev => {
                                 let hMidi = midi - 12;
                                 while (hMidi > 55) hMidi -= 12;
                                 while (hMidi < 36) hMidi += 12;
-                                const next = [...prev, midiToAbc(hMidi)];
-                                if (measureCount % qValue === 0) next.push("|");
-                                return next;
+                                const hAbc = midiToAbc(hMidi);
+
+                                const lastIdx = prev.length - 1;
+                                const lastItem = prev[lastIdx];
+
+                                if (lastItem && lastItem !== "|" && lastItem.startsWith(hAbc)) {
+                                    const match = lastItem.match(/\d+$/);
+                                    let dur = match ? parseInt(match[0]) : 1;
+                                    dur++;
+                                    const newPrev = [...prev];
+                                    newPrev[lastIdx] = hAbc + dur;
+                                    return newPrev;
+                                } else {
+                                    const next = [...prev, hAbc];
+                                    if (measureCount % qValue === 0) next.push("|");
+                                    return next;
+                                }
                             });
+
+                            // Reset frames but keep lastMidi so we continue extending
+                            stableFrames = 0;
                         }
                     } else {
+                        // New note detected, wait for it to stabilize
                         lastMidi = midi;
                         stableFrames = 0;
                     }

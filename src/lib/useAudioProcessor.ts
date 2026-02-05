@@ -45,17 +45,6 @@ export const useAudioProcessor = () => {
             });
 
             // Sensitivity Logic Refined:
-            // "Silence Threshold": The % of NULLS allowed in a chunk.
-            // If there are MORE nulls than this threshold, the whole chunk is REST.
-
-            // Sens 1.0 (High Sens) -> We want to captures notes even if they are faint/short.
-            // So we allow LOTS of nulls. Threshold should be HIGH (e.g. 0.8). 
-            // If 70% is null, that's fine, we keep the 30% note.
-
-            // Sens 0.0 (Low Sens/Strict) -> We only want pure notes. 
-            // We allow VERY FEW nulls. Threshold should be LOW (e.g. 0.2).
-            // If 30% is null, that's too much noise! Kill it.
-
             const silenceThreshold = 0.2 + (sensitivity * 0.6); // Range 0.2 to 0.8
 
             const nullRatio = nullCount / chunk.length;
@@ -82,32 +71,21 @@ export const useAudioProcessor = () => {
         }
 
         // 1.5. GAP FILLING (Legato Smoothing)
-        // Check for short gaps (nulls) between notes and fill them
         for (let i = 1; i < gridNotes.length - 1; i++) {
             const prev = gridNotes[i - 1];
             const curr = gridNotes[i];
             const next = gridNotes[i + 1];
 
             if (curr === null && prev !== null && next !== null) {
-                // If gap between two notes
-                // 1. If Same Note A _ A -> A A A
                 if (prev === next) {
                     gridNotes[i] = prev;
-                }
-                // 2. If Different Notes A _ B -> A A B (Extend prev)
-                // This makes it feel more connected
-                else {
+                } else {
                     gridNotes[i] = prev;
                 }
             }
         }
 
         // 1.6. SMART TAIL EXTENSION (Reduce "Staccato" Rests)
-        // If Note(A) -> Rest -> Note(B), keep rest.
-        // If Note(A) -> Rest -> Rest, maybe extend A?
-        // Specifically: If we have [A, A, A, null] (3 units + 1 rest), likely intended as A(4).
-        // Iterate and look for patterns.
-
         let i = 0;
         while (i < gridNotes.length) {
             if (gridNotes[i] !== null) {
@@ -119,12 +97,7 @@ export const useAudioProcessor = () => {
                     j++;
                 }
 
-                // Found run of length 'run'. Check next item.
-                // If next is null, and run is "almost" a beat...
-                // e.g. run=3 (3/16), next=null. Extend to 4.
-                // e.g. run=7 (7/16), next=null. Extend to 8.
                 if (j < gridNotes.length && gridNotes[j] === null) {
-                    // Only extend if it completes a "nice" number (4, 8)
                     if (run === 3 || run === 7 || run === 15) {
                         gridNotes[j] = pitch; // Extend tail
                     }
@@ -143,17 +116,10 @@ export const useAudioProcessor = () => {
 
         // Helper to format duration based on Q value
         const getDurStr = (d: number) => {
-            // d is number of grid units.
-            // L:1/8 default in header.
-
             if (qValue === 8) {
                 return d === 1 ? "" : d.toString();
             }
             if (qValue === 16) {
-                // 1 unit = 1/16 = "/2"
-                // 2 units = 1/8 = ""
-                // 3 units = 3/16 = "3/2"
-                // 4 units = 1/4 = "2"
                 if (d % 2 === 0) {
                     const eights = d / 2;
                     return eights === 1 ? "" : eights.toString();
@@ -162,7 +128,6 @@ export const useAudioProcessor = () => {
                 }
             }
             if (qValue === 4) {
-                // 1 unit = 1/4 = "2" (since base is 1/8)
                 return (d * 2).toString();
             }
             return d.toString();
@@ -246,8 +211,9 @@ export const useAudioProcessor = () => {
             setIsRecording(true);
 
             let lastMidi: number | null = null;
-            let measureCount = 0;
             let stableFrames = 0;
+            let isContinuous = false;
+            let gridUnitsFilled = 0;
             liveMidiRef.current = [];
 
             // Dynamic Thresholds from Analysis Logic
@@ -266,6 +232,7 @@ export const useAudioProcessor = () => {
                     setCurrentPitch(null);
                     lastMidi = null;
                     stableFrames = 0;
+                    isContinuous = false;
                     animationFrameRef.current = requestAnimationFrame(updatePitch);
                     return;
                 }
@@ -280,40 +247,51 @@ export const useAudioProcessor = () => {
 
                     if (midi === lastMidi) {
                         stableFrames++;
-                        // Require slightly more stability for live mic to avoid jitters
+                        // Require slightly more stability for live mic (6 frames ~= 100ms)
                         if (stableFrames === 6) {
                             const abc = midiToAbc(midi);
 
                             // SMART MERGE LOGIC:
-                            // Instead of pushing [C, C, C], extend previous note [C3]
-                            // This stops the UI from "twitching" (layout rebuilds)
-
+                            // Only merge if we are CONTINUOUSLY holding the note.
                             setMelody(prev => {
                                 const lastIdx = prev.length - 1;
-                                const lastItem = prev[lastIdx]; // e.g. "C" or "C2" or "|"
+                                const lastItem = prev[lastIdx];
 
-                                // Check if last item is same note
-                                if (lastItem && lastItem !== "|" && lastItem.startsWith(abc)) {
-                                    // Extract current duration number
+                                let shouldMerge = false;
+                                if (isContinuous && lastItem && lastItem !== "|" && lastItem.startsWith(abc)) {
+                                    shouldMerge = true;
+                                }
+
+                                if (shouldMerge) {
+                                    // EXTEND duration
                                     const match = lastItem.match(/\d+$/);
                                     let dur = match ? parseInt(match[0]) : 1;
                                     dur++;
-
-                                    // Replace last item with extended duration
                                     const newPrev = [...prev];
                                     newPrev[lastIdx] = abc + dur;
+
+                                    // Track Grid Units for Bar Lines
+                                    gridUnitsFilled++;
+                                    if (gridUnitsFilled >= qValue) {
+                                        newPrev.push("|");
+                                        gridUnitsFilled = 0;
+                                    }
                                     return newPrev;
                                 } else {
-                                    // New note, push it
+                                    // NEW NOTE
                                     liveMidiRef.current.push(midi);
                                     const next = [...prev, abc];
-                                    measureCount++;
-                                    if (measureCount % qValue === 0) next.push("|");
+
+                                    gridUnitsFilled++;
+                                    if (gridUnitsFilled >= qValue) {
+                                        next.push("|");
+                                        gridUnitsFilled = 0;
+                                    }
                                     return next;
                                 }
                             });
 
-                            // Real-time harmony (same merge logic)
+                            // Real-time harmony
                             setHarmony(prev => {
                                 let hMidi = midi - 12;
                                 while (hMidi > 55) hMidi -= 12;
@@ -323,32 +301,40 @@ export const useAudioProcessor = () => {
                                 const lastIdx = prev.length - 1;
                                 const lastItem = prev[lastIdx];
 
-                                if (lastItem && lastItem !== "|" && lastItem.startsWith(hAbc)) {
+                                let shouldMerge = false;
+                                if (isContinuous && lastItem && lastItem !== "|" && lastItem.startsWith(hAbc)) {
+                                    shouldMerge = true;
+                                }
+
+                                if (shouldMerge) {
                                     const match = lastItem.match(/\d+$/);
                                     let dur = match ? parseInt(match[0]) : 1;
                                     dur++;
                                     const newPrev = [...prev];
                                     newPrev[lastIdx] = hAbc + dur;
+                                    if (gridUnitsFilled === 0) newPrev.push("|"); // Sync bar logic
                                     return newPrev;
                                 } else {
                                     const next = [...prev, hAbc];
-                                    if (measureCount % qValue === 0) next.push("|");
+                                    if (gridUnitsFilled === 0) next.push("|"); // Sync bar logic
                                     return next;
                                 }
                             });
 
-                            // Reset frames but keep lastMidi so we continue extending
+                            isContinuous = true;
                             stableFrames = 0;
                         }
                     } else {
-                        // New note detected, wait for it to stabilize
+                        // New note detected
                         lastMidi = midi;
                         stableFrames = 0;
+                        isContinuous = false;
                     }
                 } else {
                     setCurrentPitch(null);
                     lastMidi = null;
                     stableFrames = 0;
+                    isContinuous = false;
                 }
 
                 animationFrameRef.current = requestAnimationFrame(updatePitch);
@@ -387,14 +373,8 @@ export const useAudioProcessor = () => {
             const detector = PitchDetector.forFloat32Array(2048);
             const input = new Float32Array(detector.inputLength);
 
-            // Small slice for raw detection (approx 30ms)
             const sliceSize = Math.floor(sampleRate * 0.03);
 
-            // 1. Raw Detection Pass
-            // Dynamic Clarity Threshold based on Sensitivity
-            // Sens 0.0 (Strict) -> Clarity 0.95
-            // Sens 0.5 (Default) -> Clarity 0.825
-            // Sens 1.0 (Loose) -> Clarity 0.60 (Captures 35% more noise space)
             const baseClarity = 0.95 - (sensitivity * 0.35);
 
             const rawMidi: (number | null)[] = [];
@@ -402,8 +382,6 @@ export const useAudioProcessor = () => {
                 input.set(channelData.subarray(i, i + detector.inputLength));
                 const [pitch, clarity] = detector.findPitch(input, sampleRate);
 
-                // Use dynamic threshold instead of hardcoded 0.85
-                // 1. FILTER: Ignore frequencies below 85Hz (Low E on scale) to kill rumble
                 if (pitch < 85 || pitch > 1200) {
                     rawMidi.push(null);
                     continue;
@@ -411,16 +389,13 @@ export const useAudioProcessor = () => {
 
                 const midi = (clarity > baseClarity) ? freqToMidi(pitch) : null;
 
-                // 2. RANGE LOCK: Force notes into Vocal Range (C3 - C6)
-                // If we detect extremely low notes (e.g. A0, A1), it's likely a sub-harmonic misdetection.
-                // Shift them up to C3 (Midi 48) minimum.
                 let correctedMidi = midi;
                 if (correctedMidi !== null) {
-                    while (correctedMidi < 48) { // Below C3
-                        correctedMidi += 12; // Shift Octave Up
+                    while (correctedMidi < 48) {
+                        correctedMidi += 12;
                     }
-                    while (correctedMidi > 84) { // Above C6
-                        correctedMidi -= 12; // Shift Octave Down
+                    while (correctedMidi > 84) {
+                        correctedMidi -= 12;
                     }
                 }
 
@@ -431,7 +406,6 @@ export const useAudioProcessor = () => {
             const autoKey = validNotes.length > 5 ? detectKey(validNotes) : "C";
             setDetectedKey(autoKey);
 
-            // Pass user settings to quantizer
             const result = quantizeMelody(rawMidi, sampleRate, sliceSize, autoKey, qValue, sensitivity);
 
             setMelody(result.melody);

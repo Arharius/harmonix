@@ -6,27 +6,46 @@ import { freqToMidi, midiToAbc, detectKey, snapToScale } from './audio-utils';
 
 export const useAudioProcessor = () => {
     const [isRecording, setIsRecording] = useState(false);
+
+    // UI States (synced from Buffers)
     const [melody, setMelody] = useState<string[]>([]);
     const [harmony, setHarmony] = useState<string[]>([]);
+
     const [detectedKey, setDetectedKey] = useState("C");
     const [currentPitch, setCurrentPitch] = useState<number | null>(null);
+
+    // Audio Context & Stream
     const audioContextRef = useRef<AudioContext | null>(null);
     const streamRef = useRef<MediaStream | null>(null);
     const analyserRef = useRef<AnalyserNode | null>(null);
     const animationFrameRef = useRef<number | null>(null);
-    const liveMidiRef = useRef<number[]>([]);
 
+    // LOGIC BUFFERS (The Source of Truth)
+    // We update these at 60fps detected, and sync to UI at lower fps.
+    const melodyBuffer = useRef<string[]>([]);
+    const harmonyBuffer = useRef<string[]>([]);
+    const liveMidiRef = useRef<number[]>([]); // For key detection
+
+    // Sync UI Interval Ref
+    const uiSyncInterval = useRef<NodeJS.Timeout | null>(null);
+
+    // Audio Logic State (Closure variables are fine, but detection state needs persistence)
+    // We keep these in Refs to be accessible if we break out logic, 
+    // but local let variables in startRecording are cleaner if the loop is self-contained.
+    // For now, we keep the loop self-contained.
+
+    // ------------------------------------------------------------------------
+    // STATIC ANALYSIS (File Upload)
+    // ------------------------------------------------------------------------
     // Function to quantize raw MIDI data into a strict rhythmic grid
-    // Now supports dynamic grid steps (4, 8, 16) and sensitivity
     const quantizeMelody = (
         rawNotes: (number | null)[],
         sampleRate: number,
         sliceSize: number,
         key: string,
         qValue: number, // 4, 8, or 16
-        sensitivity: number // 0.0 to 1.0 (Higher = captures more notes, Lower = more rests)
+        sensitivity: number
     ) => {
-        // Calculate samples per grid unit
         const secondsPerGrid = 2.0 / qValue;
         const samplesPerGrid = sampleRate * secondsPerGrid;
         const slicesPerGrid = Math.max(1, Math.round(samplesPerGrid / sliceSize));
@@ -44,9 +63,8 @@ export const useAudioProcessor = () => {
                 else counts[n] = (counts[n] || 0) + 1;
             });
 
-            // Sensitivity Logic Refined:
+            // Sensitivity Logic
             const silenceThreshold = 0.2 + (sensitivity * 0.6); // Range 0.2 to 0.8
-
             const nullRatio = nullCount / chunk.length;
 
             if (nullRatio > silenceThreshold) {
@@ -70,7 +88,7 @@ export const useAudioProcessor = () => {
             }
         }
 
-        // 1.5. GAP FILLING (Legato Smoothing)
+        // 1.5. GAP FILLING
         for (let i = 1; i < gridNotes.length - 1; i++) {
             const prev = gridNotes[i - 1];
             const curr = gridNotes[i];
@@ -85,7 +103,7 @@ export const useAudioProcessor = () => {
             }
         }
 
-        // 1.6. SMART TAIL EXTENSION (Reduce "Staccato" Rests)
+        // 1.6. SMART TAIL EXTENSION
         let i = 0;
         while (i < gridNotes.length) {
             if (gridNotes[i] !== null) {
@@ -108,17 +126,14 @@ export const useAudioProcessor = () => {
             }
         }
 
-        // 2. Generate ABC from Grid with strict Bar Splitting
+        // 2. Generate ABC from Grid
         const melRes: string[] = [];
         const harRes: string[] = [];
         let lastNote: number | null = null;
         let duration = 0;
 
-        // Helper to format duration based on Q value
         const getDurStr = (d: number) => {
-            if (qValue === 8) {
-                return d === 1 ? "" : d.toString();
-            }
+            if (qValue === 8) return d === 1 ? "" : d.toString();
             if (qValue === 16) {
                 if (d % 2 === 0) {
                     const eights = d / 2;
@@ -127,9 +142,7 @@ export const useAudioProcessor = () => {
                     return d === 1 ? "/2" : `${d}/2`;
                 }
             }
-            if (qValue === 4) {
-                return (d * 2).toString();
-            }
+            if (qValue === 4) return (d * 2).toString();
             return d.toString();
         };
 
@@ -142,7 +155,6 @@ export const useAudioProcessor = () => {
                 const safeAbc = (abc && abc !== "undefined") ? abc : "z";
                 melRes.push(safeAbc + durStr);
 
-                // Harmony logic
                 let hMidi = note - 12;
                 while (hMidi > 55) hMidi -= 12;
                 while (hMidi < 36) hMidi += 12;
@@ -188,10 +200,74 @@ export const useAudioProcessor = () => {
         return { melody: melRes, harmony: harRes };
     };
 
-    const startRecording = useCallback(async (qValue: number = 8, sensitivity: number = 0.5) => {
+    const analyzeFile = useCallback(async (file: File, qValue: number = 8, sensitivity: number = 0.5) => {
         try {
             setMelody([]);
             setHarmony([]);
+
+            const arrayBuffer = await file.arrayBuffer();
+            const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+            const ctx = new AudioContextClass();
+            const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+
+            const sampleRate = audioBuffer.sampleRate;
+            const channelData = audioBuffer.getChannelData(0);
+            const detector = PitchDetector.forFloat32Array(2048);
+            const input = new Float32Array(detector.inputLength);
+
+            const sliceSize = Math.floor(sampleRate * 0.03);
+            const baseClarity = 0.95 - (sensitivity * 0.35);
+
+            const rawMidi: (number | null)[] = [];
+            for (let i = 0; i < channelData.length - detector.inputLength; i += sliceSize) {
+                input.set(channelData.subarray(i, i + detector.inputLength));
+                const [pitch, clarity] = detector.findPitch(input, sampleRate);
+
+                if (pitch < 85 || pitch > 1200) {
+                    rawMidi.push(null);
+                    continue;
+                }
+
+                const midi = (clarity > baseClarity) ? freqToMidi(pitch) : null;
+                let correctedMidi = midi;
+                if (correctedMidi !== null) {
+                    while (correctedMidi < 48) correctedMidi += 12;
+                    while (correctedMidi > 84) correctedMidi -= 12;
+                }
+                rawMidi.push(correctedMidi);
+            }
+
+            const validNotes = rawMidi.filter(m => m !== null) as number[];
+            const autoKey = validNotes.length > 5 ? detectKey(validNotes) : "C";
+            setDetectedKey(autoKey);
+
+            const result = quantizeMelody(rawMidi, sampleRate, sliceSize, autoKey, qValue, sensitivity);
+            setMelody(result.melody);
+            setHarmony(result.harmony);
+
+            ctx.close();
+        } catch (err) {
+            console.error("Error analyzing file:", err);
+            alert("Ошибка при анализе файла: " + err);
+        }
+    }, []);
+
+
+    // ------------------------------------------------------------------------
+    // REAL-TIME RECORDING (Buffer-Synced Architecture)
+    // ------------------------------------------------------------------------
+    const startRecording = useCallback(async (qValue: number = 8, sensitivity: number = 0.5) => {
+        try {
+            // Reset Buffers
+            melodyBuffer.current = [];
+            harmonyBuffer.current = [];
+            liveMidiRef.current = [];
+
+            // Clean Re-start checks
+            if (uiSyncInterval.current) clearInterval(uiSyncInterval.current);
+            setMelody([]);
+            setHarmony([]);
+
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
             streamRef.current = stream;
 
@@ -210,159 +286,131 @@ export const useAudioProcessor = () => {
 
             setIsRecording(true);
 
+            // LOGIC STATE
             let lastMidi: number | null = null;
             let stableFrames = 0;
             let isContinuous = false;
             let gridUnitsFilled = 0;
-            liveMidiRef.current = [];
 
-            // Dynamic Thresholds from Analysis Logic
+            // Slightly reduced threshold for better responsiveness
+            // Sens 0.5 -> 0.775 clarity threshold (Good for voice)
             const baseClarity = 0.95 - (sensitivity * 0.35);
 
+            // START AUDIO LOOP (60fps)
             const updatePitch = async () => {
                 try {
-                    if (audioContext.state === 'suspended') {
-                        await audioContext.resume();
-                    }
+                    if (audioContext.state === 'suspended') await audioContext.resume();
 
                     analyser.getFloatTimeDomainData(input);
                     const [pitch, clarity] = detector.findPitch(input, audioContext.sampleRate);
 
-                    // 1. FILTER: Ignore frequencies below 85Hz
-                    if (pitch < 85 || pitch > 1200) {
+                    // Silence / Noise Filter
+                    if (pitch < 85 || pitch > 1200 || clarity < baseClarity) {
                         setCurrentPitch(null);
                         lastMidi = null;
                         stableFrames = 0;
                         isContinuous = false;
-                        animationFrameRef.current = requestAnimationFrame(updatePitch);
-                        return;
-                    }
-
-                    if (clarity > baseClarity) {
+                    } else {
+                        // DETECTED NOTE
                         setCurrentPitch(pitch);
                         let midi = freqToMidi(pitch);
 
-                        // 2. RANGE LOCK: Force into Vocal Range (C3 - C6)
+                        // Range Lock
                         while (midi < 48) midi += 12;
                         while (midi > 84) midi -= 12;
 
                         if (midi === lastMidi) {
                             stableFrames++;
-                            // Require slightly more stability for live mic (6 frames ~= 100ms)
+                            // Debounce (Buffer of 6 frames ~ 100ms)
                             if (stableFrames === 6) {
                                 const abc = midiToAbc(midi);
+                                let hMidi = midi - 12;
+                                while (hMidi > 55) hMidi -= 12;
+                                while (hMidi < 36) hMidi += 12;
+                                const hAbc = midiToAbc(hMidi);
 
-                                // LOGIC: Check continuation
-                                const prevMelody = liveMidiRef.current; // We can't access state directly here safely without dependency
-                                // But we have isContinuous flag.
+                                // ------------------------------------
+                                // BUFFER MUTATION LOGIC (Fast & Safe)
+                                // ------------------------------------
+                                const mel = melodyBuffer.current;
+                                const har = harmonyBuffer.current;
+                                const lastIdx = mel.length - 1;
+                                const lastItem = mel[lastIdx];
 
-                                // CALCULATE BAR INSERTION OUTSIDE SETTERS
-                                let shouldInsertBar = false;
-
-                                // We are adding 1 unit of duration (either by extend or new note)
-                                // So we increment grid tracker.
-                                // NOTE: merging extends duration, so it consumes grid space just like a new note.
-                                // BUT: 'gridUnitsFilled' tracks *total duration* 1/8ths. 
-                                // e.g. C (1) -> C2 (2) -> C3 (3). Each frame adds 1 unit?
-                                // NO! We are sampling at specific intervals?
-                                // stableFrames triggers every 6 frames.
-                                // If we merge, we increment the duration counter in the ABC string.
-                                // That counts as 1 grid unit?
-                                // Yes, assuming the loop roughly matches grid speed? 
-                                // Actually pure loop speed is independent of BPM.
-                                // This is an approximation. Ideally we sync to time.
-                                // But for now, we assume 1 event = 1 grid unit.
-
-                                gridUnitsFilled++;
-                                if (gridUnitsFilled >= qValue) {
-                                    shouldInsertBar = true;
-                                    gridUnitsFilled = 0;
+                                let shouldMerge = false;
+                                if (isContinuous && lastItem && lastItem !== "|" && lastItem.startsWith(abc)) {
+                                    shouldMerge = true;
                                 }
 
-                                setMelody(prev => {
-                                    const lastIdx = prev.length - 1;
-                                    const lastItem = prev[lastIdx];
+                                // Calculate Bar Sync Logic FIRST
+                                // Each event (Push or Extend) consumes 1 detection unit of time
+                                // We simplify this to "1 event = 1 unit" for now.
+                                gridUnitsFilled++;
+                                const insertBar = (gridUnitsFilled >= qValue);
+                                if (insertBar) gridUnitsFilled = 0;
 
-                                    let shouldMerge = false;
-                                    if (isContinuous && lastItem && lastItem !== "|" && lastItem.startsWith(abc)) {
-                                        shouldMerge = true;
-                                    }
+                                if (shouldMerge) {
+                                    // MODIFY last items
+                                    const match = lastItem.match(/\d+$/);
+                                    let dur = match ? parseInt(match[0]) : 1;
+                                    dur++;
 
-                                    if (shouldMerge) {
-                                        // EXTEND duration
-                                        const match = lastItem.match(/\d+$/);
-                                        let dur = match ? parseInt(match[0]) : 1;
-                                        dur++;
-                                        const newPrev = [...prev];
-                                        newPrev[lastIdx] = abc + dur;
+                                    mel[lastIdx] = abc + dur;
 
-                                        if (shouldInsertBar) newPrev.push("|");
-                                        return newPrev;
-                                    } else {
-                                        // NEW NOTE
-                                        liveMidiRef.current.push(midi);
-                                        const next = [...prev, abc];
+                                    const hLast = har[lastIdx];
+                                    const hMatch = hLast.match(/\d+$/);
+                                    let hDur = hMatch ? parseInt(hMatch[0]) : 1;
+                                    hDur++;
+                                    har[lastIdx] = hAbc + hDur;
+                                } else {
+                                    // PUSH new items
+                                    liveMidiRef.current.push(midi);
+                                    mel.push(abc);
+                                    har.push(hAbc);
+                                }
 
-                                        if (shouldInsertBar) next.push("|");
-                                        return next;
-                                    }
-                                });
-
-                                // Real-time harmony
-                                setHarmony(prev => {
-                                    let hMidi = midi - 12;
-                                    while (hMidi > 55) hMidi -= 12;
-                                    while (hMidi < 36) hMidi += 12;
-                                    const hAbc = midiToAbc(hMidi);
-
-                                    const lastIdx = prev.length - 1;
-                                    const lastItem = prev[lastIdx];
-
-                                    let shouldMerge = false;
-                                    if (isContinuous && lastItem && lastItem !== "|" && lastItem.startsWith(hAbc)) {
-                                        shouldMerge = true;
-                                    }
-
-                                    if (shouldMerge) {
-                                        const match = lastItem.match(/\d+$/);
-                                        let dur = match ? parseInt(match[0]) : 1;
-                                        dur++;
-                                        const newPrev = [...prev];
-                                        newPrev[lastIdx] = hAbc + dur;
-                                        if (shouldInsertBar) newPrev.push("|");
-                                        return newPrev;
-                                    } else {
-                                        const next = [...prev, hAbc];
-                                        if (shouldInsertBar) next.push("|");
-                                        return next;
-                                    }
-                                });
+                                if (insertBar) {
+                                    mel.push("|");
+                                    har.push("|");
+                                }
 
                                 isContinuous = true;
                                 stableFrames = 0;
                             }
                         } else {
-                            // New note detected
+                            // Changed Note detected (reset)
                             lastMidi = midi;
                             stableFrames = 0;
                             isContinuous = false;
                         }
-                    } else {
-                        setCurrentPitch(null);
-                        lastMidi = null;
-                        stableFrames = 0;
-                        isContinuous = false;
                     }
 
                     animationFrameRef.current = requestAnimationFrame(updatePitch);
                 } catch (e) {
-                    console.error("Audio Processing Error:", e);
-                    // attempt to restart loop?
+                    console.error("Audio Loop Error:", e);
                     animationFrameRef.current = requestAnimationFrame(updatePitch);
                 }
             };
 
             updatePitch();
+
+            // START UI SYNC LOOP (10fps / 100ms)
+            // This prevents "Twitching" by batching updates.
+            uiSyncInterval.current = setInterval(() => {
+                // Determine if we need to update
+                // Simple diff check: length comparison is usually enough for "additions"
+                // But merging changes content length (char count), not array length.
+                // So we basically ALWAYS update if recording? 
+                // Or we can check a dirty flag.
+                // For now, unconditional update at 10fps is cheap for React.
+
+                if (melodyBuffer.current.length > 0) {
+                    // Creating new array references forces re-render
+                    setMelody([...melodyBuffer.current]);
+                    setHarmony([...harmonyBuffer.current]);
+                }
+            }, 100);
+
         } catch (err) {
             console.error("Error accessing microphone:", err);
             alert("Ошибка доступа к микрофону");
@@ -372,6 +420,8 @@ export const useAudioProcessor = () => {
     const stopRecording = useCallback(() => {
         setIsRecording(false);
         if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+        if (uiSyncInterval.current) clearInterval(uiSyncInterval.current);
+
         if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
         if (audioContextRef.current) audioContextRef.current.close();
 
@@ -380,67 +430,9 @@ export const useAudioProcessor = () => {
         }
     }, []);
 
-    const analyzeFile = useCallback(async (file: File, qValue: number = 8, sensitivity: number = 0.5) => {
-        try {
-            setMelody([]);
-            setHarmony([]);
-
-            const arrayBuffer = await file.arrayBuffer();
-            const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-            const ctx = new AudioContextClass();
-            const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-
-            const sampleRate = audioBuffer.sampleRate;
-            const channelData = audioBuffer.getChannelData(0);
-            const detector = PitchDetector.forFloat32Array(2048);
-            const input = new Float32Array(detector.inputLength);
-
-            const sliceSize = Math.floor(sampleRate * 0.03);
-
-            const baseClarity = 0.95 - (sensitivity * 0.35);
-
-            const rawMidi: (number | null)[] = [];
-            for (let i = 0; i < channelData.length - detector.inputLength; i += sliceSize) {
-                input.set(channelData.subarray(i, i + detector.inputLength));
-                const [pitch, clarity] = detector.findPitch(input, sampleRate);
-
-                if (pitch < 85 || pitch > 1200) {
-                    rawMidi.push(null);
-                    continue;
-                }
-
-                const midi = (clarity > baseClarity) ? freqToMidi(pitch) : null;
-
-                let correctedMidi = midi;
-                if (correctedMidi !== null) {
-                    while (correctedMidi < 48) {
-                        correctedMidi += 12;
-                    }
-                    while (correctedMidi > 84) {
-                        correctedMidi -= 12;
-                    }
-                }
-
-                rawMidi.push(correctedMidi);
-            }
-
-            const validNotes = rawMidi.filter(m => m !== null) as number[];
-            const autoKey = validNotes.length > 5 ? detectKey(validNotes) : "C";
-            setDetectedKey(autoKey);
-
-            const result = quantizeMelody(rawMidi, sampleRate, sliceSize, autoKey, qValue, sensitivity);
-
-            setMelody(result.melody);
-            setHarmony(result.harmony);
-
-            ctx.close();
-        } catch (err) {
-            console.error("Error analyzing file:", err);
-            alert("Ошибка при анализе файла: " + err);
-        }
-    }, []);
-
     const clearNotes = () => {
+        melodyBuffer.current = [];
+        harmonyBuffer.current = [];
         setMelody([]);
         setHarmony([]);
     };

@@ -291,10 +291,11 @@ export const useAudioProcessor = () => {
             let stableFrames = 0;
             let isContinuous = false;
             let gridUnitsFilled = 0;
+            let silenceFrames = 0; // Grace period counter
 
-            // Slightly reduced threshold for better responsiveness
-            // Sens 0.5 -> 0.775 clarity threshold (Good for voice)
-            const baseClarity = 0.95 - (sensitivity * 0.35);
+            // Lower thresholds significantly to ensure detection
+            // Sens 0.5 -> 0.65 (Much more forgiving)
+            const baseClarity = 0.90 - (sensitivity * 0.5);
 
             // START AUDIO LOOP (60fps)
             const updatePitch = async () => {
@@ -304,25 +305,55 @@ export const useAudioProcessor = () => {
                     analyser.getFloatTimeDomainData(input);
                     const [pitch, clarity] = detector.findPitch(input, audioContext.sampleRate);
 
-                    // Silence / Noise Filter
-                    if (pitch < 85 || pitch > 1200 || clarity < baseClarity) {
-                        setCurrentPitch(null);
-                        lastMidi = null;
-                        stableFrames = 0;
-                        isContinuous = false;
-                    } else {
-                        // DETECTED NOTE
-                        setCurrentPitch(pitch);
-                        let midi = freqToMidi(pitch);
+                    let isValidSignal = true;
 
-                        // Range Lock
-                        while (midi < 48) midi += 12;
-                        while (midi > 84) midi -= 12;
+                    // 1. RAW SIGNAL CHECK
+                    if (pitch < 85 || pitch > 1200 || clarity < baseClarity) {
+                        isValidSignal = false;
+                    }
+
+                    // 2. HYSTERESIS / GRACE PERIOD LOGIC
+                    if (!isValidSignal) {
+                        silenceFrames++;
+                        // If we have a short drop (less than 10 frames / ~160ms) AND we were continuous,
+                        // PRETEND we still have the signal to bridge the gap.
+                        if (silenceFrames < 10 && isContinuous) {
+                            // KEEP STATE: Do nothing (hold previous note)
+                            // We simulate "valid signal" but with same pitch as before?
+                            // Actually, we just SKIP logic processing and let the UI hold the visual?
+                            // No, we need to increment duration if we want it to "hold" rhythmically.
+
+                            // BETTER: Trigger a "Hold" update with the LAST known midi.
+                            // But we need 'lastMidi' to remain valid.
+                            isValidSignal = true;
+                            // We reuse 'lastMidi' from closure state.
+                        } else {
+                            // Real Silence
+                            setCurrentPitch(null);
+                            lastMidi = null;
+                            stableFrames = 0;
+                            isContinuous = false;
+                        }
+                    } else {
+                        // Valid Signal -> Reset silence counter
+                        silenceFrames = 0;
+                    }
+
+                    if (isValidSignal) {
+                        // Use actual pitch if fresh, or keep lastMidi if in grace period
+                        let midi = (silenceFrames > 0) ? (lastMidi || 60) : freqToMidi(pitch);
+
+                        if (silenceFrames === 0) {
+                            setCurrentPitch(pitch);
+                            // Range Lock only on real new data
+                            while (midi < 48) midi += 12;
+                            while (midi > 84) midi -= 12;
+                        }
 
                         if (midi === lastMidi) {
                             stableFrames++;
-                            // Debounce (Buffer of 6 frames ~ 100ms)
-                            if (stableFrames === 6) {
+                            // Debounce (Reduces to 3 frames ~50ms for responsiveness)
+                            if (stableFrames >= 3) {
                                 const abc = midiToAbc(midi);
                                 let hMidi = midi - 12;
                                 while (hMidi > 55) hMidi -= 12;
@@ -330,7 +361,7 @@ export const useAudioProcessor = () => {
                                 const hAbc = midiToAbc(hMidi);
 
                                 // ------------------------------------
-                                // BUFFER MUTATION LOGIC (Fast & Safe)
+                                // BUFFER MUTATION
                                 // ------------------------------------
                                 const mel = melodyBuffer.current;
                                 const har = harmonyBuffer.current;
@@ -338,19 +369,18 @@ export const useAudioProcessor = () => {
                                 const lastItem = mel[lastIdx];
 
                                 let shouldMerge = false;
+                                // Crucial: We only merge if isContinuous is true. 
+                                // Since Grace Period keeps isContinuous=true, this bridges the gap!
                                 if (isContinuous && lastItem && lastItem !== "|" && lastItem.startsWith(abc)) {
                                     shouldMerge = true;
                                 }
 
-                                // Calculate Bar Sync Logic FIRST
-                                // Each event (Push or Extend) consumes 1 detection unit of time
-                                // We simplify this to "1 event = 1 unit" for now.
                                 gridUnitsFilled++;
                                 const insertBar = (gridUnitsFilled >= qValue);
                                 if (insertBar) gridUnitsFilled = 0;
 
                                 if (shouldMerge) {
-                                    // MODIFY last items
+                                    // EXTEND
                                     const match = lastItem.match(/\d+$/);
                                     let dur = match ? parseInt(match[0]) : 1;
                                     dur++;
@@ -363,7 +393,7 @@ export const useAudioProcessor = () => {
                                     hDur++;
                                     har[lastIdx] = hAbc + hDur;
                                 } else {
-                                    // PUSH new items
+                                    // PUSH
                                     liveMidiRef.current.push(midi);
                                     mel.push(abc);
                                     har.push(hAbc);
@@ -375,14 +405,20 @@ export const useAudioProcessor = () => {
                                 }
 
                                 isContinuous = true;
-                                stableFrames = 0;
+                                stableFrames = 0; // Reset counter BUT keep continuity
+                                // Wait, if we reset stableFrames, we might re-trigger "Push" logic next frame?
+                                // No, because 'isContinuous' is true, so next frame 'shouldMerge' will be true!
+                                // Correct.
                             }
                         } else {
-                            // Changed Note detected (reset)
+                            // New Note
                             lastMidi = midi;
                             stableFrames = 0;
-                            isContinuous = false;
+                            isContinuous = false; // Break continuity on pitch change
                         }
+                    } else {
+                        // Fallback for safety (should be covered by !isValidSignal block)
+                        isContinuous = false;
                     }
 
                     animationFrameRef.current = requestAnimationFrame(updatePitch);

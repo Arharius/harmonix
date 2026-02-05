@@ -268,7 +268,15 @@ export const useAudioProcessor = () => {
             setMelody([]);
             setHarmony([]);
 
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            // CRITICAL FOR MOBILE: Disable native processing
+            // Phones kill sustained notes thinking they are 'echo' or 'noise'
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: false,
+                    autoGainControl: false,
+                    noiseSuppression: false
+                }
+            });
             streamRef.current = stream;
 
             const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;

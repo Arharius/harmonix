@@ -223,7 +223,7 @@ export const useAudioProcessor = () => {
         return { melody: melRes, harmony: harRes };
     };
 
-    const startRecording = useCallback(async () => {
+    const startRecording = useCallback(async (qValue: number = 8, sensitivity: number = 0.5) => {
         try {
             setMelody([]);
             setHarmony([]);
@@ -250,6 +250,9 @@ export const useAudioProcessor = () => {
             let stableFrames = 0;
             liveMidiRef.current = [];
 
+            // Dynamic Thresholds from Analysis Logic
+            const baseClarity = 0.95 - (sensitivity * 0.35);
+
             const updatePitch = async () => {
                 if (audioContext.state === 'suspended') {
                     await audioContext.resume();
@@ -258,19 +261,33 @@ export const useAudioProcessor = () => {
                 analyser.getFloatTimeDomainData(input);
                 const [pitch, clarity] = detector.findPitch(input, audioContext.sampleRate);
 
-                if (clarity > 0.85 && pitch > 50 && pitch < 1200) {
+                // 1. FILTER: Ignore frequencies below 85Hz
+                if (pitch < 85 || pitch > 1200) {
+                    setCurrentPitch(null);
+                    lastMidi = null;
+                    stableFrames = 0;
+                    animationFrameRef.current = requestAnimationFrame(updatePitch);
+                    return;
+                }
+
+                if (clarity > baseClarity) {
                     setCurrentPitch(pitch);
-                    const midi = freqToMidi(pitch);
+                    let midi = freqToMidi(pitch);
+
+                    // 2. RANGE LOCK: Force into Vocal Range (C3 - C6)
+                    while (midi < 48) midi += 12;
+                    while (midi > 84) midi -= 12;
 
                     if (midi === lastMidi) {
                         stableFrames++;
-                        if (stableFrames === 5) {
+                        // Require slightly more stability for live mic to avoid jitters
+                        if (stableFrames === 6) {
                             const abc = midiToAbc(midi);
                             liveMidiRef.current.push(midi);
                             setMelody(prev => {
                                 const next = [...prev, abc];
                                 measureCount++;
-                                if (measureCount % 8 === 0) next.push("|");
+                                if (measureCount % qValue === 0) next.push("|"); // Use qValue for bar lines
                                 return next;
                             });
                             // Real-time harmony
@@ -279,7 +296,7 @@ export const useAudioProcessor = () => {
                                 while (hMidi > 55) hMidi -= 12;
                                 while (hMidi < 36) hMidi += 12;
                                 const next = [...prev, midiToAbc(hMidi)];
-                                if (measureCount % 8 === 0) next.push("|");
+                                if (measureCount % qValue === 0) next.push("|");
                                 return next;
                             });
                         }

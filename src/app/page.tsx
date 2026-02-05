@@ -196,7 +196,7 @@ ${harBody}`;
 
               <div className="flex gap-3">
                 {!isRecording ? (
-                  <button onClick={startRecording} className="btn btn-primary" style={{ flex: 2 }}>
+                  <button onClick={() => startRecording(qValue, sensitivity)} className="btn btn-primary" style={{ flex: 2 }}>
                     <Mic size={20} /> Запись
                   </button>
                 ) : (

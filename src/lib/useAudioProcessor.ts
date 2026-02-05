@@ -220,124 +220,146 @@ export const useAudioProcessor = () => {
             const baseClarity = 0.95 - (sensitivity * 0.35);
 
             const updatePitch = async () => {
-                if (audioContext.state === 'suspended') {
-                    await audioContext.resume();
-                }
+                try {
+                    if (audioContext.state === 'suspended') {
+                        await audioContext.resume();
+                    }
 
-                analyser.getFloatTimeDomainData(input);
-                const [pitch, clarity] = detector.findPitch(input, audioContext.sampleRate);
+                    analyser.getFloatTimeDomainData(input);
+                    const [pitch, clarity] = detector.findPitch(input, audioContext.sampleRate);
 
-                // 1. FILTER: Ignore frequencies below 85Hz
-                if (pitch < 85 || pitch > 1200) {
-                    setCurrentPitch(null);
-                    lastMidi = null;
-                    stableFrames = 0;
-                    isContinuous = false;
-                    animationFrameRef.current = requestAnimationFrame(updatePitch);
-                    return;
-                }
+                    // 1. FILTER: Ignore frequencies below 85Hz
+                    if (pitch < 85 || pitch > 1200) {
+                        setCurrentPitch(null);
+                        lastMidi = null;
+                        stableFrames = 0;
+                        isContinuous = false;
+                        animationFrameRef.current = requestAnimationFrame(updatePitch);
+                        return;
+                    }
 
-                if (clarity > baseClarity) {
-                    setCurrentPitch(pitch);
-                    let midi = freqToMidi(pitch);
+                    if (clarity > baseClarity) {
+                        setCurrentPitch(pitch);
+                        let midi = freqToMidi(pitch);
 
-                    // 2. RANGE LOCK: Force into Vocal Range (C3 - C6)
-                    while (midi < 48) midi += 12;
-                    while (midi > 84) midi -= 12;
+                        // 2. RANGE LOCK: Force into Vocal Range (C3 - C6)
+                        while (midi < 48) midi += 12;
+                        while (midi > 84) midi -= 12;
 
-                    if (midi === lastMidi) {
-                        stableFrames++;
-                        // Require slightly more stability for live mic (6 frames ~= 100ms)
-                        if (stableFrames === 6) {
-                            const abc = midiToAbc(midi);
+                        if (midi === lastMidi) {
+                            stableFrames++;
+                            // Require slightly more stability for live mic (6 frames ~= 100ms)
+                            if (stableFrames === 6) {
+                                const abc = midiToAbc(midi);
 
-                            // SMART MERGE LOGIC:
-                            // Only merge if we are CONTINUOUSLY holding the note.
-                            setMelody(prev => {
-                                const lastIdx = prev.length - 1;
-                                const lastItem = prev[lastIdx];
+                                // LOGIC: Check continuation
+                                const prevMelody = liveMidiRef.current; // We can't access state directly here safely without dependency
+                                // But we have isContinuous flag.
 
-                                let shouldMerge = false;
-                                if (isContinuous && lastItem && lastItem !== "|" && lastItem.startsWith(abc)) {
-                                    shouldMerge = true;
+                                // CALCULATE BAR INSERTION OUTSIDE SETTERS
+                                let shouldInsertBar = false;
+
+                                // We are adding 1 unit of duration (either by extend or new note)
+                                // So we increment grid tracker.
+                                // NOTE: merging extends duration, so it consumes grid space just like a new note.
+                                // BUT: 'gridUnitsFilled' tracks *total duration* 1/8ths. 
+                                // e.g. C (1) -> C2 (2) -> C3 (3). Each frame adds 1 unit?
+                                // NO! We are sampling at specific intervals?
+                                // stableFrames triggers every 6 frames.
+                                // If we merge, we increment the duration counter in the ABC string.
+                                // That counts as 1 grid unit?
+                                // Yes, assuming the loop roughly matches grid speed? 
+                                // Actually pure loop speed is independent of BPM.
+                                // This is an approximation. Ideally we sync to time.
+                                // But for now, we assume 1 event = 1 grid unit.
+
+                                gridUnitsFilled++;
+                                if (gridUnitsFilled >= qValue) {
+                                    shouldInsertBar = true;
+                                    gridUnitsFilled = 0;
                                 }
 
-                                if (shouldMerge) {
-                                    // EXTEND duration
-                                    const match = lastItem.match(/\d+$/);
-                                    let dur = match ? parseInt(match[0]) : 1;
-                                    dur++;
-                                    const newPrev = [...prev];
-                                    newPrev[lastIdx] = abc + dur;
+                                setMelody(prev => {
+                                    const lastIdx = prev.length - 1;
+                                    const lastItem = prev[lastIdx];
 
-                                    // Track Grid Units for Bar Lines
-                                    gridUnitsFilled++;
-                                    if (gridUnitsFilled >= qValue) {
-                                        newPrev.push("|");
-                                        gridUnitsFilled = 0;
+                                    let shouldMerge = false;
+                                    if (isContinuous && lastItem && lastItem !== "|" && lastItem.startsWith(abc)) {
+                                        shouldMerge = true;
                                     }
-                                    return newPrev;
-                                } else {
-                                    // NEW NOTE
-                                    liveMidiRef.current.push(midi);
-                                    const next = [...prev, abc];
 
-                                    gridUnitsFilled++;
-                                    if (gridUnitsFilled >= qValue) {
-                                        next.push("|");
-                                        gridUnitsFilled = 0;
+                                    if (shouldMerge) {
+                                        // EXTEND duration
+                                        const match = lastItem.match(/\d+$/);
+                                        let dur = match ? parseInt(match[0]) : 1;
+                                        dur++;
+                                        const newPrev = [...prev];
+                                        newPrev[lastIdx] = abc + dur;
+
+                                        if (shouldInsertBar) newPrev.push("|");
+                                        return newPrev;
+                                    } else {
+                                        // NEW NOTE
+                                        liveMidiRef.current.push(midi);
+                                        const next = [...prev, abc];
+
+                                        if (shouldInsertBar) next.push("|");
+                                        return next;
                                     }
-                                    return next;
-                                }
-                            });
+                                });
 
-                            // Real-time harmony
-                            setHarmony(prev => {
-                                let hMidi = midi - 12;
-                                while (hMidi > 55) hMidi -= 12;
-                                while (hMidi < 36) hMidi += 12;
-                                const hAbc = midiToAbc(hMidi);
+                                // Real-time harmony
+                                setHarmony(prev => {
+                                    let hMidi = midi - 12;
+                                    while (hMidi > 55) hMidi -= 12;
+                                    while (hMidi < 36) hMidi += 12;
+                                    const hAbc = midiToAbc(hMidi);
 
-                                const lastIdx = prev.length - 1;
-                                const lastItem = prev[lastIdx];
+                                    const lastIdx = prev.length - 1;
+                                    const lastItem = prev[lastIdx];
 
-                                let shouldMerge = false;
-                                if (isContinuous && lastItem && lastItem !== "|" && lastItem.startsWith(hAbc)) {
-                                    shouldMerge = true;
-                                }
+                                    let shouldMerge = false;
+                                    if (isContinuous && lastItem && lastItem !== "|" && lastItem.startsWith(hAbc)) {
+                                        shouldMerge = true;
+                                    }
 
-                                if (shouldMerge) {
-                                    const match = lastItem.match(/\d+$/);
-                                    let dur = match ? parseInt(match[0]) : 1;
-                                    dur++;
-                                    const newPrev = [...prev];
-                                    newPrev[lastIdx] = hAbc + dur;
-                                    if (gridUnitsFilled === 0) newPrev.push("|"); // Sync bar logic
-                                    return newPrev;
-                                } else {
-                                    const next = [...prev, hAbc];
-                                    if (gridUnitsFilled === 0) next.push("|"); // Sync bar logic
-                                    return next;
-                                }
-                            });
+                                    if (shouldMerge) {
+                                        const match = lastItem.match(/\d+$/);
+                                        let dur = match ? parseInt(match[0]) : 1;
+                                        dur++;
+                                        const newPrev = [...prev];
+                                        newPrev[lastIdx] = hAbc + dur;
+                                        if (shouldInsertBar) newPrev.push("|");
+                                        return newPrev;
+                                    } else {
+                                        const next = [...prev, hAbc];
+                                        if (shouldInsertBar) next.push("|");
+                                        return next;
+                                    }
+                                });
 
-                            isContinuous = true;
+                                isContinuous = true;
+                                stableFrames = 0;
+                            }
+                        } else {
+                            // New note detected
+                            lastMidi = midi;
                             stableFrames = 0;
+                            isContinuous = false;
                         }
                     } else {
-                        // New note detected
-                        lastMidi = midi;
+                        setCurrentPitch(null);
+                        lastMidi = null;
                         stableFrames = 0;
                         isContinuous = false;
                     }
-                } else {
-                    setCurrentPitch(null);
-                    lastMidi = null;
-                    stableFrames = 0;
-                    isContinuous = false;
-                }
 
-                animationFrameRef.current = requestAnimationFrame(updatePitch);
+                    animationFrameRef.current = requestAnimationFrame(updatePitch);
+                } catch (e) {
+                    console.error("Audio Processing Error:", e);
+                    // attempt to restart loop?
+                    animationFrameRef.current = requestAnimationFrame(updatePitch);
+                }
             };
 
             updatePitch();
